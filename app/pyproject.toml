@@ -8,6 +8,6 @@ dependencies = [
     "matplotlib>=3.10.7",
     "pandas>=2.3.3",
     "pyserial>=3.5",
-    "pywavelet>=0.2.8",
+    "pywavelets>=1.9.0",
     "scipy>=1.16.2",
 ]

@@ -5,7 +5,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib import pyplot as plt
 import pandas as pd
 import numpy as np
-from scipy.signal import butter, filtfilt, iirnotch
+from scipy.signal import butter, iirnotch, lfilter
 import pywt
 
 BAUDRATES = ["9600", "19200", "38400", "57600", "115200"]
@@ -84,7 +84,7 @@ class ScrollableTextArea(tk.Frame):
 
 
 class PlotArea(tk.Frame):
-    def __init__(self, master, fs=1000):
+    def __init__(self, master, fs=500):
         super().__init__(master)
         self.fs = fs
         self.figure, self.ax = plt.subplots(3, 2, figsize=(8, 8))
@@ -105,43 +105,33 @@ class PlotArea(tk.Frame):
         s1 = np.array(data["sensor_1"])
         s2 = np.array(data["sensor_2"])
 
-        # Filter and get envelopes
-        if len(s1) > 200:
-            fil1, env1 = filter_emg(s1, self.fs)
-            fil2, env2 = filter_emg(s2, self.fs)
-        else:
-            fil1, env1, fil2, env2 = s1, s1, s2, s2
+        kalman_1 = np.array(data.get("kalman_1", []))
+        kalman_2 = np.array(data.get("kalman_2", []))
+        band_1 = np.array(data.get("filtered_1", []))
+        band_2 = np.array(data.get("filtered_2", []))
 
         # Raw signals
         self.ax[0, 0].plot(t, s1, label="Sensor 1 Raw", color='b')
-        # self.ax[0, 0].plot(t, s2, label="Sensor 2 Raw", color='r')
         self.ax[0, 0].set_title("Raw Signals")
 
-        # self.ax[0, 1].plot(t, s1, label="Sensor 1 Raw", color='b')
         self.ax[0, 1].plot(t, s2, label="Sensor 2 Raw", color='r')
         self.ax[0, 1].set_title("Raw Signals")
 
-        # Filtered signals
-        self.ax[1, 0].plot(t, fil1, label="Sensor 1 Filtered", color='b')
-        # self.ax[1, 0].plot(t, fil2, label="Sensor 2 Filtered", color='r')
-        self.ax[1, 0].set_title("Filtered EMG")
+        # Bandpass Filtered Signals
+        if len(band_1) > 0:
+            self.ax[2, 0].plot(t, band_1, label="Sensor 1 Bandpass", color='c')
+            self.ax[2, 0].set_title("Bandpass Filtered Sensor 1")
+        if len(band_2) > 0:
+            self.ax[2, 1].plot(t, band_2, label="Sensor 2 Bandpass", color='orange')
+            self.ax[2, 1].set_title("Bandpass Filtered Sensor 2")
 
-        # self.ax[1, 1].plot(t, fil1, label="Sensor 1 Filtered", color='b')
-        self.ax[1, 1].plot(t, fil2, label="Sensor 2 Filtered", color='r')
-        self.ax[1, 1].set_title("Filtered EMG")
-
-        # Envelopes
-        self.ax[2, 0].plot(t, env1, label="Sensor 1 Envelope", color='b')
-        # self.ax[2, 0].plot(t, env2, label="Sensor 2 Envelope", color='r')
-        self.ax[2, 0].set_title("Envelope")
-
-        # self.ax[2, 1].plot(t, env1, label="Sensor 1 Envelope", color='b')
-        self.ax[2, 1].plot(t, env2, label="Sensor 2 Envelope", color='r')
-        self.ax[2, 1].set_title("Envelope")
-
-        # for a in self.ax:
-        #     a.legend()
-        #     a.grid(True)
+        # Kalman Estimates
+        if len(kalman_1) > 0:
+            self.ax[1, 0].plot(t, kalman_1, label="Sensor 1 Kalman", color='g')
+            self.ax[1, 0].set_title("Kalman Estimate Sensor 1")
+        if len(kalman_2) > 0:
+            self.ax[1, 1].plot(t, kalman_2, label="Sensor 2 Kalman", color='m')
+            self.ax[1, 1].set_title("Kalman Estimate Sensor 2")
 
         self.canvas.draw()
 
@@ -198,15 +188,16 @@ class SerialConnectionManager:
     
 
 def create_window():
-    recorded_data = {
-        "sensor_1": [],
-        "sensor_2": [],
-        "time_stamp": []
-    }
+    recorded_data = {}
     # Create the main application window
     window = tk.Tk()
     window.title("Sample Tkinter Window")
     window.geometry("800x600")
+    # Initialize real-time estimator objects with default sampling rate.
+    # They will be updated automatically when the Sample Rate field changes.
+    emg_filter_1 = EMGFilterAndEstimator(fs=500, hum_freq=50)
+    emg_filter_2 = EMGFilterAndEstimator(fs=500, hum_freq=50)
+
     # Create frames for organizing the layout
     control_frame = tk.Frame(master=window)
     info_frame = tk.Frame(master=window)
@@ -228,7 +219,7 @@ def create_window():
     clear_plots_button = ActionButton(master=info_frame, button_text="Clear Plots", command=lambda: plot_area.clear_plots())
     
     send_cmd_frame = tk.Frame(master=control_frame)
-    sample_rate_field = InputField(master=send_cmd_frame, label_text="Sample Rate:", default_value="1000")
+    sample_rate_field = InputField(master=send_cmd_frame, label_text="Sample Rate:", default_value="500")
     measurement_duration_field = InputField(master=send_cmd_frame, label_text="Measurement Duration (s):", default_value="10")
     send_cmd_button = ActionButton(
         master=send_cmd_frame, button_text="Start Measurement", 
@@ -240,9 +231,30 @@ def create_window():
             save_file_button,
             serial_monitor,
             plot_area, 
-            window
+            window,
+            emg_filter_1,
+            emg_filter_2
         )
     )
+
+    # Auto-update filters when the sample rate field is changed (on focus out or Enter)
+    def on_sample_rate_change(event=None):
+        try:
+            fs_val = int(sample_rate_field.get_value())
+            if fs_val <= 0:
+                raise ValueError("fs must be positive")
+        except Exception as e:
+            serial_monitor.append_text(f"Invalid sample rate: {e}")
+            return
+
+        # Update filters to use the new sampling rate
+        emg_filter_1.update_fs(fs_val)
+        emg_filter_2.update_fs(fs_val)
+        plot_area.fs = fs_val
+        serial_monitor.append_text(f"Updated sampling rate to {fs_val} Hz and redesigned filters.")
+
+    sample_rate_field.entry.bind("<FocusOut>", on_sample_rate_change)
+    sample_rate_field.entry.bind("<Return>", on_sample_rate_change)
     serial_config_frame.pack(side=tk.TOP, fill=tk.X)
     send_cmd_frame.pack(side=tk.TOP, fill=tk.X) 
     save_file_frame.pack(side=tk.TOP, fill=tk.X)
@@ -256,29 +268,53 @@ def create_window():
     info_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
     return window
 
-def start_measurement(serial_manager, sample_rate, duration, recorded_data, save_file_button, serial_monitor, plot_area, window):
-    recorded_data = {
-        "sensor_1": [],
-        "sensor_2": [],
-        "time_stamp": []
-    }
+def start_measurement(serial_manager, sample_rate, duration, recorded_data, save_file_button, serial_monitor, plot_area, window, emg_filter_1, emg_filter_2):
+    # Reset filter states and recorded data
+    recorded_data["sensor_1"] = []
+    recorded_data["sensor_2"] = []
+    recorded_data["time_stamp"] = []
+    recorded_data["kalman_1"] = [] 
+    recorded_data["kalman_2"] = [] 
+    recorded_data["filtered_1"] = []
+    recorded_data["filtered_2"] = []
+
+    # NOTE: You might want to re-initialize or reset the internal state (zi_notch, kf_state, etc.) of 
+    # emg_filter_1 and emg_filter_2 here if they are reused for multiple runs!
+    
     save_file_button.set_state(tk.DISABLED)
     serial_manager.write_data(f"START, {sample_rate}, {duration}")
     mesage = ""
     count = 0
     while mesage != "DONE":
         mesage = serial_manager.read_data()
-        count = (count + 1)%100
+        count = (count + 1)%200
         serial_monitor.append_text(mesage)
+        
         if ',' in mesage:
-            timestamp, sensor_1, sensor_2 = [int(i.strip()) for i in mesage.split(',')]
-            if sensor_1 is not None and sensor_2 is not None:
+            try:
+                timestamp, sensor_1, sensor_2 = [int(i.strip()) for i in mesage.split(',')]
+                
+                # --- NEW REAL-TIME PROCESSING ---
+                # Process the new raw sample through the causal filters and Kalman
+                # The returned values are the *current* filtered/estimated values.
+                band_out_1, _, kalman_estimate_1 = emg_filter_1.process_sample(sensor_1)
+                band_out_2, _, kalman_estimate_2 = emg_filter_2.process_sample(sensor_2)
+
+                # Append raw data and the new estimates
                 recorded_data["sensor_1"].append(sensor_1)
                 recorded_data["sensor_2"].append(sensor_2)
-                recorded_data["time_stamp"].append(timestamp / 1_000_000)  # Convert microseconds to seconds
+                recorded_data["kalman_1"].append(kalman_estimate_1) # Append Kalman estimate
+                recorded_data["kalman_2"].append(kalman_estimate_2) # Append Kalman estimate
+                recorded_data["filtered_1"].append(band_out_1)  # Optionally store filtered data
+                recorded_data["filtered_2"].append(band_out_2)  # Optionally store filtered data
+                recorded_data["time_stamp"].append(timestamp / 1_000_000)
+                
                 if count == 0:
                     plot_area.plot_data(recorded_data)
                     window.update()
+            except ValueError:
+                # Handle cases where data format is incorrect
+                continue
 
     save_file_button.set_state(tk.NORMAL)
 
@@ -291,46 +327,130 @@ def get_serial_ports():
     ports = list_ports.comports()
     return [port.device for port in ports]
 
-def lowpass_env(x, fs):
-    nyq = 0.5 * fs
-    w = 5 / nyq
-    b, a = butter(4, w, btype='low')
-    return filtfilt(b, a, np.abs(x))
+def causal_filter(b, a, data, z_hist):
+    """
+    Applies a causal digital filter (IIR or FIR) using lfilter and manages 
+    the filter state for continuous, real-time processing.
+    """
+    if len(data) == 0:
+        return np.array([]), z_hist
 
-def filter_emg(signal, fs):
-    if len(signal) < 100:  # Too short for filtfilt
-        return signal, np.abs(signal)
+    # Apply the filter and update the state
+    filtered_data, z_new = lfilter(b, a, data, zi=z_hist)
+    
+    # Store the new state for the next chunk of data
+    return filtered_data, z_new
 
-    # --- Bandpass 20–200 Hz ---
-    cut_low = 20 / (fs / 2)
-    cut_high = 200 / (fs / 2)
-    b1, a1 = butter(4, [cut_low, cut_high], btype='bandpass')
-    try:
-        emg1 = filtfilt(b1, a1, signal)
-    except ValueError:
-        return signal, np.abs(signal)
+# --- EMG Preprocessor with Causal Filters and Kalman Filter ---
+class EMGFilterAndEstimator:
+    def __init__(self, fs=500, hum_freq=50):
+        # Store parameters
+        self.fs = fs
+        self.hum_freq = hum_freq
 
-    # --- Notch filters at 50, 100, 150 Hz ---
-    for notch_freq in [50, 100, 150]:
-        Q = notch_freq / 10  # bandwidth = 10 Hz
-        b_notch, a_notch = iirnotch(notch_freq / (fs / 2), Q)
+        # design all filters based on current sampling rate
+        self._design_filters()
+
+        # 4. Kalman Filter for Motion State Estimation
+        # State: [Envelope Value]
+        # A=1 (simple model: value stays the same unless acted upon)
+        # H=1 (we measure the envelope directly)
+        self.kf_A = np.array([[1.0]]) # State Transition Matrix
+        self.kf_H = np.array([[1.0]]) # Measurement Matrix
+        self.kf_Q = 1e-3 # Process Noise Covariance (Trust in the model)
+        self.kf_R = 1e-1 # Measurement Noise Covariance (Trust in the measurement)
+
+        # Initial State and Covariance
+        self.kf_state = np.array([[0.0]]) # x_hat_k-1
+        self.kf_P = np.array([[1.0]])     # P_k-1
+
+    def _design_filters(self):
+        """
+        Design bandpass, envelope lowpass, and multi-harmonic notch filters
+        for the current sampling rate and hum frequency.
+        """
+        nyq = 0.5 * self.fs
+
+        # Notch filters for hum and its harmonics (50, 100, 150, ...)
+        self.notches = []
+        if self.hum_freq is not None and self.hum_freq > 0:
+            max_harm = int(nyq // self.hum_freq)
+            for k in range(1, max_harm + 1):
+                f_h = self.hum_freq * k
+                if f_h >= nyq:
+                    break
+                # design a narrow notch at f_h
+                b_n, a_n = iirnotch(f_h / nyq, Q=30)
+                zi_n = np.zeros(max(len(a_n), len(b_n)) - 1)
+                self.notches.append({"b": b_n, "a": a_n, "zi": zi_n, "f": f_h})
+
+        # Bandpass Filter (20-450 Hz for raw EMG - Causal)
+        low_cut = 20 / nyq
+        high_cut = min(450 / nyq, 0.999)
+        if low_cut >= high_cut:
+            # fallback to sensible defaults if sample rate is too low
+            low_cut = max(0.001, 20 / (0.5 * self.fs))
+            high_cut = min(0.499, high_cut)
+        self.b_band, self.a_band = butter(2, [low_cut, high_cut], btype='bandpass', output='ba')
+        self.zi_band = np.zeros(max(len(self.a_band), len(self.b_band)) - 1)
+
+        # Lowpass Filter for Envelope (4th order, 5 Hz cutoff - Causal)
+        env_cut = min(5 / nyq, 0.499)
+        self.b_env, self.a_env = butter(4, env_cut, btype='low', output='ba')
+        self.zi_env = np.zeros(max(len(self.a_env), len(self.b_env)) - 1)
+
+    def process_sample(self, raw_sample):
+        # 1. Hum Removal: apply each designed notch filter in cascade
+        notch_signal = np.array([raw_sample])
+        for notch in self.notches:
+            notch_signal, zi_new = causal_filter(notch["b"], notch["a"], notch_signal, notch["zi"])
+            notch["zi"] = zi_new
+
+        # 2. Bandpass Filtering (Causal)
+        band_out, self.zi_band = causal_filter(self.b_band, self.a_band, notch_signal, self.zi_band)
+        
+        # 3. Rectification
+        rectified = np.abs(band_out)
+        
+        # 4. Lowpass Filtering for Envelope (Causal)
+        env_out, self.zi_env = causal_filter(
+            self.b_env, self.a_env, rectified, self.zi_env
+        )
+        measurement = env_out[0]
+
+        # --- Kalman Filter Steps ---
+        # 5. Predict
+        x_pred = self.kf_A @ self.kf_state
+        P_pred = self.kf_A @ self.kf_P @ self.kf_A.T + self.kf_Q
+        
+        # 6. Update (Incorporate measurement)
+        y = measurement - self.kf_H @ x_pred
+        S = self.kf_H @ P_pred @ self.kf_H.T + self.kf_R
+        K = P_pred @ self.kf_H.T @ np.linalg.inv(S) # Kalman Gain
+        
+        self.kf_state = x_pred + K @ y
+        self.kf_P = P_pred - K @ self.kf_H @ P_pred
+        
+        # The Kalman state is the final, smoothed, real-time motion estimate
+        real_time_estimate = self.kf_state[0, 0]
+        
+        return band_out[0], measurement, real_time_estimate
+
+    def update_fs(self, fs):
+        """
+        Update the sampling rate and redesign all filters. This will reset
+        filter internal states (zi) to zeros to match the new designs.
+        """
         try:
-            emg1 = filtfilt(b_notch, a_notch, emg1)
+            fs_val = int(fs)
+            if fs_val <= 0:
+                raise ValueError("fs must be positive")
         except Exception as e:
-            # skip unstable filter for short signals
-            continue
+            raise
 
-    # --- Wavelet denoising ---
-    coeffs = pywt.wavedec(emg1, 'db8', level=4)
-    sigma = np.median(np.abs(coeffs[-1])) / 0.6745
-    uthresh = sigma * np.sqrt(2 * np.log(len(signal)))
-    coeffs_thresh = [pywt.threshold(c, value=uthresh, mode='soft') for c in coeffs]
-    denoised = pywt.waverec(coeffs_thresh, 'db8')
-    denoised = denoised[:len(signal)]
-
-    # --- Envelope ---
-    envelope = lowpass_env(denoised, 1000)
-    return denoised, envelope
+        self.fs = fs_val
+        # redesign filters and reset states
+        self._design_filters()
 
 def main():
     window = create_window()
