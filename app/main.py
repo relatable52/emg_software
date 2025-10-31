@@ -7,8 +7,38 @@ import pandas as pd
 import numpy as np
 from scipy.signal import butter, iirnotch, lfilter
 import pywt
+import time
+from collections import deque
 
 BAUDRATES = ["9600", "19200", "38400", "57600", "115200"]
+
+# Performance monitoring
+class PerformanceStats:
+    def __init__(self, window_size=100):
+        self.filter_times = deque(maxlen=window_size)
+        self.plot_times = deque(maxlen=window_size)
+        self.last_sample_time = None
+    
+    def add_filter_time(self, t):
+        self.filter_times.append(t)
+    
+    def add_plot_time(self, t):
+        self.plot_times.append(t)
+    
+    def set_sample_timestamp(self, t):
+        self.last_sample_time = t
+    
+    def get_stats(self):
+        if not self.filter_times or not self.plot_times:
+            return "No timing data yet"
+        
+        avg_filter = sum(self.filter_times) / len(self.filter_times) * 1000
+        max_filter = max(self.filter_times) * 1000
+        avg_plot = sum(self.plot_times) / len(self.plot_times) * 1000
+        max_plot = max(self.plot_times) * 1000
+        
+        return (f"Filter: avg={avg_filter:.2f}ms max={max_filter:.2f}ms\n"
+                f"Plot: avg={avg_plot:.2f}ms max={max_plot:.2f}ms")
 
 
 class InputField(tk.Frame):
@@ -244,14 +274,13 @@ def create_window():
             if fs_val <= 0:
                 raise ValueError("fs must be positive")
         except Exception as e:
-            serial_monitor.append_text(f"Invalid sample rate: {e}")
+            print(f"Invalid sample rate: {e}")
             return
 
         # Update filters to use the new sampling rate
         emg_filter_1.update_fs(fs_val)
         emg_filter_2.update_fs(fs_val)
         plot_area.fs = fs_val
-        serial_monitor.append_text(f"Updated sampling rate to {fs_val} Hz and redesigned filters.")
 
     sample_rate_field.entry.bind("<FocusOut>", on_sample_rate_change)
     sample_rate_field.entry.bind("<Return>", on_sample_rate_change)
@@ -278,8 +307,13 @@ def start_measurement(serial_manager, sample_rate, duration, recorded_data, save
     recorded_data["filtered_1"] = []
     recorded_data["filtered_2"] = []
 
+    # Create performance monitor
+    perf_stats = PerformanceStats()
+    
     # NOTE: You might want to re-initialize or reset the internal state (zi_notch, kf_state, etc.) of 
     # emg_filter_1 and emg_filter_2 here if they are reused for multiple runs!
+    emg_filter_1.reset()
+    emg_filter_2.reset()
     
     save_file_button.set_state(tk.DISABLED)
     serial_manager.write_data(f"START, {sample_rate}, {duration}")
@@ -287,31 +321,47 @@ def start_measurement(serial_manager, sample_rate, duration, recorded_data, save
     count = 0
     while mesage != "DONE":
         mesage = serial_manager.read_data()
-        count = (count + 1)%200
+        count = (count + 1)%500
         serial_monitor.append_text(mesage)
         
         if ',' in mesage:
             try:
                 timestamp, sensor_1, sensor_2 = [int(i.strip()) for i in mesage.split(',')]
                 
+                # Time the filter processing
+                t_filter_start = time.perf_counter()
+                
                 # --- NEW REAL-TIME PROCESSING ---
                 # Process the new raw sample through the causal filters and Kalman
                 # The returned values are the *current* filtered/estimated values.
-                band_out_1, _, kalman_estimate_1 = emg_filter_1.process_sample(sensor_1)
-                band_out_2, _, kalman_estimate_2 = emg_filter_2.process_sample(sensor_2)
+                band_out_1, env_1 = emg_filter_1.process_sample(sensor_1)
+                band_out_2, env_2 = emg_filter_2.process_sample(sensor_2)
+
+                # Record filter processing time
+                filter_time = time.perf_counter() - t_filter_start
+                perf_stats.add_filter_time(filter_time)
 
                 # Append raw data and the new estimates
                 recorded_data["sensor_1"].append(sensor_1)
                 recorded_data["sensor_2"].append(sensor_2)
-                recorded_data["kalman_1"].append(kalman_estimate_1) # Append Kalman estimate
-                recorded_data["kalman_2"].append(kalman_estimate_2) # Append Kalman estimate
+                recorded_data["kalman_1"].append(env_1) # Append Kalman estimate
+                recorded_data["kalman_2"].append(env_2) # Append Kalman estimate
                 recorded_data["filtered_1"].append(band_out_1)  # Optionally store filtered data
                 recorded_data["filtered_2"].append(band_out_2)  # Optionally store filtered data
                 recorded_data["time_stamp"].append(timestamp / 1_000_000)
                 
                 if count == 0:
+                    # Time the plotting
+                    t_plot_start = time.perf_counter()
                     plot_area.plot_data(recorded_data)
                     window.update()
+                    plot_time = time.perf_counter() - t_plot_start
+                    perf_stats.add_plot_time(plot_time)
+                    
+                    # Show timing stats every 200 samples
+                    serial_monitor.append_text("\n=== Performance Stats ===")
+                    serial_monitor.append_text(perf_stats.get_stats())
+                    serial_monitor.append_text("=====================\n")
             except ValueError:
                 # Handle cases where data format is incorrect
                 continue
@@ -418,23 +468,23 @@ class EMGFilterAndEstimator:
         )
         measurement = env_out[0]
 
-        # --- Kalman Filter Steps ---
-        # 5. Predict
-        x_pred = self.kf_A @ self.kf_state
-        P_pred = self.kf_A @ self.kf_P @ self.kf_A.T + self.kf_Q
+        # # --- Kalman Filter Steps ---
+        # # 5. Predict
+        # x_pred = self.kf_A @ self.kf_state
+        # P_pred = self.kf_A @ self.kf_P @ self.kf_A.T + self.kf_Q
         
-        # 6. Update (Incorporate measurement)
-        y = measurement - self.kf_H @ x_pred
-        S = self.kf_H @ P_pred @ self.kf_H.T + self.kf_R
-        K = P_pred @ self.kf_H.T @ np.linalg.inv(S) # Kalman Gain
+        # # 6. Update (Incorporate measurement)
+        # y = measurement - self.kf_H @ x_pred
+        # S = self.kf_H @ P_pred @ self.kf_H.T + self.kf_R
+        # K = P_pred @ self.kf_H.T @ np.linalg.inv(S) # Kalman Gain
         
-        self.kf_state = x_pred + K @ y
-        self.kf_P = P_pred - K @ self.kf_H @ P_pred
+        # self.kf_state = x_pred + K @ y
+        # self.kf_P = P_pred - K @ self.kf_H @ P_pred
         
-        # The Kalman state is the final, smoothed, real-time motion estimate
-        real_time_estimate = self.kf_state[0, 0]
+        # # The Kalman state is the final, smoothed, real-time motion estimate
+        # real_time_estimate = self.kf_state[0, 0]
         
-        return band_out[0], measurement, real_time_estimate
+        return band_out[0], measurement
 
     def update_fs(self, fs):
         """
@@ -449,6 +499,13 @@ class EMGFilterAndEstimator:
             raise
 
         self.fs = fs_val
+        # redesign filters and reset states
+        self._design_filters()
+
+    def reset(self):
+        """
+        Reset filter states and Kalman filter state.
+        """
         # redesign filters and reset states
         self._design_filters()
 
