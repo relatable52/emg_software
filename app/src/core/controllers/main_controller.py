@@ -1,5 +1,5 @@
 from PySide6.QtCore import QObject, QThread, QTimer, Slot
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QMessageBox, QFileDialog
 from PySide6.QtSerialPort import QSerialPortInfo
 
 # Import Data Models
@@ -156,8 +156,34 @@ class MainController(QObject):
 
     def save_recording(self):
         """Save the recorded data to file"""
-        # TODO: Implement save functionality
-        self.log("Save functionality not yet implemented.")
+        # Check if there's data to save
+        if not self.state.time or len(self.state.time) == 0:
+            QMessageBox.warning(self.window, "No Data", "No recording data to save.")
+            return
+        
+        # Open file dialog to choose save location
+        filepath, _ = QFileDialog.getSaveFileName(
+            self.window,
+            "Save Recording",
+            "",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        
+        # User cancelled the dialog
+        if not filepath:
+            return
+        
+        # Ensure .csv extension
+        if not filepath.lower().endswith('.csv'):
+            filepath += '.csv'
+        
+        try:
+            self.state.save_to_csv(filepath)
+            self.log(f"Recording saved to: {filepath}")
+            QMessageBox.information(self.window, "Success", f"Recording saved to:\n{filepath}")
+        except Exception as e:
+            self.log(f"Error saving file: {e}")
+            QMessageBox.critical(self.window, "Save Error", f"Failed to save recording:\n{e}")
 
     # --- DATA HANDLING ---
 
