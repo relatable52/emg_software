@@ -1,77 +1,153 @@
 #include <Arduino.h>
 
-#define SENSOR_1 A0
-#define SENSOR_2 A5
+// --- Configuration ---
+const int SENSOR_PINS[8] = {26, 36, 39, 34, 35, 32, 33, 25};
 
-unsigned long interval = 1000;  // microseconds between samples (set dynamically)
-unsigned long lastSampleTime = 0;
-bool recording = false;
-unsigned long recordStartMillis = 0;
-unsigned long recordDurationMs = 0;
+// --- Protocol Definitions ---
+const uint8_t CMD_HEADER = 0xAA;
+const uint8_t CMD_START  = 0x01;
+const uint8_t CMD_STOP   = 0x02;
+
+// The struct receiving data FROM the PC
+struct __attribute__((packed)) CommandPacket {
+    uint8_t header;       // Should be 0xAA
+    uint8_t type;         // 0x01 = Start, 0x02 = Stop
+    uint32_t sampleRate;  // e.g., 1000
+    uint32_t durationMs;  // e.g., 10000 (0 for infinite)
+};
+
+// The struct sending data TO the PC
+struct __attribute__((packed)) DataPacket {
+    uint32_t timestamp;
+    uint16_t values[8]; 
+    uint16_t terminator;
+};
+
+// --- Globals ---
+volatile bool triggerSample = false;  // Flag from Interrupt
+bool isStreaming = false;             // State variable
+unsigned long streamStartTime = 0;
+uint32_t streamDuration = 0;
+
+DataPacket txPacket;
+hw_timer_t *timer = NULL;
+
+// --- Interrupt ---
+void IRAM_ATTR onTimer() {
+    if (isStreaming) {
+        triggerSample = true;
+    }
+}
+
+// --- Forward Declarations ---
+void handleIncomingSerial();
+void startStreaming(uint32_t rate, uint32_t duration);
+void stopStreaming();
+void sendStopPacket(); // <--- NEW
 
 void setup() {
-  Serial.begin(115200);
-  while(!Serial) {
-    ; // wait for serial port to connect. Needed for native USB
-  }
-  Serial.println("Serial Initialized");
+    Serial.begin(921600);
+    
+    // Setup Pins
+    for(int i=0; i<8; i++) pinMode(SENSOR_PINS[i], INPUT);
+    
+    // Setup Timer (Initialized but not running high freq yet)
+    // ESP32 timer API varies by version, assuming v2.x here based on your snippet
+    timer = timerBegin(0, 80, true); // 1 tick = 1us
+    timerAttachInterrupt(timer, &onTimer, true);
+    
+    txPacket.terminator = 0xAAAA; 
 }
 
 void loop() {
-  int sensorValue1 = 0;
-  int sensorValue2 = 0;
-  
-  while (!recording) {
-    if (Serial.available() > 0) {
-      String command = Serial.readStringUntil('\n');
-      command.trim();
+    // 1. Check for incoming commands from PC
+    handleIncomingSerial();
 
-      if (command.startsWith("START")) {
-        int firstComma = command.indexOf(',');
-        int secondComma = command.indexOf(',', firstComma + 1);
-
-        if (firstComma > 0 && secondComma > firstComma) {
-          int sampleRate = command.substring(firstComma + 1, secondComma).toInt();
-          int durationSec = command.substring(secondComma + 1).toInt();
-
-          if (sampleRate > 0 && durationSec > 0) {
-            interval = 1000000UL / sampleRate;
-            recordDurationMs = (unsigned long)durationSec * 1000UL;
-            recording = true;
-            recordStartMillis = millis();
-
-            Serial.print("RECORDING ");
-            Serial.print(sampleRate);
-            Serial.print("Hz for ");
-            Serial.print(durationSec);
-            Serial.println("s");
-          } else {
-            Serial.println("ERROR: Invalid parameters");
-          }
-
-          Serial.println("Reading Started");
+    // 2. Handle Data Streaming
+    if (isStreaming && triggerSample) {
+        triggerSample = false;
+        
+        // Check duration (if not infinite)
+        if (streamDuration > 0 && (millis() - streamStartTime >= streamDuration)) {
+            stopStreaming(); // This will now send the stop packet
+            return;
         }
-      }
+
+        // Capture & Send
+        txPacket.timestamp = micros();
+        for(int i=0; i<8; i++) {
+            txPacket.values[i] = analogRead(SENSOR_PINS[i]);
+        }
+        Serial.write((uint8_t*)&txPacket, sizeof(txPacket));
     }
-  }
-  while (recording) {
-    unsigned long currentMicros = micros();
-    if (currentMicros - lastSampleTime >= interval) {
-      lastSampleTime = currentMicros;
+}
 
-      sensorValue1 = analogRead(SENSOR_1);
-      sensorValue2 = analogRead(SENSOR_2);
+// --- Helper Logic ---
 
-      Serial.print(currentMicros);
-      Serial.print(",");
-      Serial.print(sensorValue1);
-      Serial.print(",");
-      Serial.println(sensorValue2);
+void handleIncomingSerial() {
+    // We need at least the size of a command packet to proceed
+    if (Serial.available() >= sizeof(CommandPacket)) {
+        
+        if (Serial.peek() != CMD_HEADER) {
+            Serial.read(); // Discard garbage
+            return;
+        }
 
-      if (millis() - recordStartMillis >= recordDurationMs) {
-        recording = false;
-        Serial.println("DONE");
-      }
+        CommandPacket cmd;
+        Serial.readBytes((char*)&cmd, sizeof(cmd));
+
+        if (cmd.type == CMD_START) {
+            startStreaming(cmd.sampleRate, cmd.durationMs);
+        } 
+        else if (cmd.type == CMD_STOP) {
+            stopStreaming();
+        }
     }
-  }
+}
+
+void startStreaming(uint32_t rate, uint32_t duration) {
+    if (rate == 0) rate = 1000; 
+    
+    uint64_t alarmVal = 1000000 / rate;
+    
+    timerAlarmDisable(timer);
+    timerAlarmWrite(timer, alarmVal, true);
+    timerAlarmEnable(timer);
+
+    streamDuration = duration;
+    streamStartTime = millis();
+    isStreaming = true;
+    
+    // Optional: Reset buffer? 
+    // Serial.flush() only flushes TX, not RX. 
+    // To clear RX: while(Serial.available()) Serial.read();
+}
+
+// --- MODIFIED FUNCTION ---
+void stopStreaming() {
+    // Only send the packet if we were previously running
+    // This prevents spamming stop packets if the user clicks Stop twice
+    if (isStreaming) {
+        sendStopPacket();
+    }
+
+    isStreaming = false;
+    triggerSample = false;
+    timerAlarmDisable(timer); 
+}
+
+// --- NEW FUNCTION ---
+void sendStopPacket() {
+    DataPacket stopPkg;
+    
+    // The "Magic" Timestamp that Python looks for
+    stopPkg.timestamp = 0xFFFFFFFF; 
+    
+    // Fill sensors with 0
+    memset(stopPkg.values, 0, sizeof(stopPkg.values));
+    
+    // Use the same terminator so Python's validation doesn't reject it
+    stopPkg.terminator = 0xAAAA; 
+    
+    Serial.write((uint8_t*)&stopPkg, sizeof(stopPkg));
 }
