@@ -50,6 +50,7 @@ Python application for processing and visualizing EMG signals acquired from the 
 1. Connect the EMG hardware
 2. Run the main application:
    ```bash
+   cd src
    python main.py
    ```
 
